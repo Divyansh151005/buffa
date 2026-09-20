@@ -343,6 +343,8 @@ pub enum PoolError {
         start: Option<i32>,
         end: Option<i32>,
     },
+    /// An enum declares no values.
+    EmptyEnum { enum_name: String },
 }
 
 /// Renders an optional range bound for [`PoolError`] messages: the number,
@@ -584,6 +586,9 @@ impl core::fmt::Display for PoolError {
                 Bound(*start),
                 Bound(*end),
             ),
+            Self::EmptyEnum { enum_name } => {
+                write!(f, "enum {enum_name} declares no values")
+            }
         }
     }
 }
@@ -1856,6 +1861,9 @@ impl DescriptorPool {
             format!("{parent_fqn}.{name}")
         };
         let enum_features = features::resolve_child(parent_features, features::enum_features(e));
+        if e.value.is_empty() {
+            return Err(PoolError::EmptyEnum { enum_name: fqn });
+        }
         if enum_features.enum_type == EnumType::Open {
             if let Some(first) = e.value.first() {
                 let number = first.number.unwrap_or(0);
