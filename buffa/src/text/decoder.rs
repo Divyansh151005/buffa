@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use super::error::{ParseError, ParseErrorKind};
 use super::string::{unescape, unescape_str, UnescapeError};
 use super::token::{
-    lex_number, number_for_parse, NumKind, ScalarKind, Token, TokenKind, Tokenizer,
+    consume_ws, lex_number, number_for_parse, NumKind, ScalarKind, Token, TokenKind, Tokenizer,
 };
 
 /// Stateful textproto reader.
@@ -138,8 +138,9 @@ impl<'a> TextDecoder<'a> {
     /// Construct an unknown-field error pointing at the last name returned
     /// by [`read_field_name`](Self::read_field_name).
     ///
-    /// Generated `merge_text` wildcard arms use this when they want to fail
-    /// fast on unknown fields rather than [`skip_value`](Self::skip_value).
+    /// Generated `merge_text` wildcard arms return this for any name that is
+    /// neither a declared field nor a declared reserved name; reserved names
+    /// are consumed with [`skip_value`](Self::skip_value) instead.
     pub fn unknown_field(&self) -> ParseError {
         let (line, col) = self.tok.line_col(self.last_name_pos);
         ParseError::new(line, col, ParseErrorKind::UnknownField)
@@ -286,7 +287,8 @@ impl<'a> TextDecoder<'a> {
     /// Read an `f32` value.
     ///
     /// Accepts any numeric form plus the case-insensitive literals `nan`,
-    /// `inf`, `infinity`, each optionally with a leading `-`. Overflow
+    /// `inf`, `infinity`, each optionally with a leading `-` (whitespace or
+    /// comments may separate the sign from the literal). Overflow
     /// saturates to ±∞ (matching C++ text-format behaviour).
     ///
     /// # Errors
@@ -310,11 +312,18 @@ impl<'a> TextDecoder<'a> {
         match tok.scalar_kind {
             ScalarKind::Literal => {
                 // nan, inf, infinity, -inf, -infinity (case-insensitive).
-                // trim_start: the tokenizer accepts `- inf` with whitespace
-                // between the sign and the literal, so the raw span may
-                // contain it.
+                // The tokenizer accepts whitespace/comments between `-` and
+                // the literal, so reuse its trivia handling for the raw span.
                 let (neg, lit) = match tok.raw.strip_prefix('-') {
-                    Some(r) => (true, r.trim_start()),
+                    Some(r) => {
+                        // `consume_ws` only stops after an ASCII whitespace
+                        // byte or a comment's `\n`, neither of which can sit
+                        // inside a multi-byte sequence, so the offset is a
+                        // char boundary even when a comment holds non-ASCII.
+                        let trivia_len = r.len() - consume_ws(r.as_bytes()).len();
+                        debug_assert!(r.is_char_boundary(trivia_len));
+                        (true, &r[trivia_len..])
+                    }
                     None => (false, tok.raw),
                 };
                 let v = if lit.eq_ignore_ascii_case("nan") {
@@ -687,8 +696,10 @@ impl<'a> TextDecoder<'a> {
 
     /// Consume a field's value without interpreting it.
     ///
-    /// Used for unknown fields when the caller wants to skip rather than
-    /// fail. Handles scalars, messages, and lists (recursively).
+    /// Generated `merge_text` impls call this for declared reserved field
+    /// names; hand-written impls can call it for any name they want to accept
+    /// and discard rather than fail on. Handles scalars, messages (`{}` and
+    /// `<>`), and lists (recursively).
     ///
     /// # Errors
     ///
@@ -929,6 +940,8 @@ mod tests {
             ("f: -inf",       "-inf"),
             ("f: - inf",      "-inf"),    // whitespace after sign
             ("f: -\tinf",     "-inf"),
+            ("f: - # c\ninf", "-inf"),  // comment after sign
+            ("f: -#c\n nan", "nan"),
             ("f: infinity",   "inf"),
             ("f: Infinity",   "inf"),
             ("f: -INFINITY",  "-inf"),

@@ -46,6 +46,20 @@ fn all_scalars_golden() {
 }
 
 #[test]
+fn signed_special_floats_allow_comments_between_sign_and_literal() {
+    let inf: AllScalars = decode_from_str("f_float: - # comment\ninf").unwrap();
+    assert!(inf.f_float.is_infinite() && inf.f_float.is_sign_negative());
+
+    let infinity: AllScalars = decode_from_str("f_double: -\n# comment\ninfinity").unwrap();
+    assert!(infinity.f_double.is_infinite() && infinity.f_double.is_sign_negative());
+
+    let nan: AllScalars = decode_from_str("f_double: -\n# comment\nnan").unwrap();
+    // Sign bit is only guaranteed for the negation, so assert it on the
+    // f64 path rather than through the f32 cast.
+    assert!(nan.f_double.is_nan() && nan.f_double.is_sign_negative());
+}
+
+#[test]
 fn default_encodes_to_empty() {
     // Implicit presence: all-zero → nothing emitted.
     assert_eq!(encode_to_string(&AllScalars::default()), "");
@@ -272,12 +286,49 @@ fn map_decode_missing_key_or_value_defaults() {
 // ── unknown fields ──────────────────────────────────────────────────────────
 
 #[test]
-fn unknown_fields_skipped() {
-    // Generated merge_text skips unknowns via skip_value.
-    let p: Person =
-        decode_from_str(r#"not_a_field: 42 id: 1 also_unknown { x: "y" } name: "ok""#).unwrap();
-    assert_eq!(p.id, 1);
-    assert_eq!(p.name, "ok");
+fn unknown_fields_rejected_by_default() {
+    let err =
+        decode_from_str::<Person>(r#"not_a_field: 42 id: 1 also_unknown { x: "y" } name: "ok""#)
+            .unwrap_err();
+    assert_eq!(err.kind, ParseErrorKind::UnknownField);
+    assert_eq!(err.line, 1);
+    assert_eq!(err.col, 1);
+}
+
+#[test]
+fn unknown_nested_fields_rejected_by_default() {
+    let err = decode_from_str::<Person>(r#"address { city: "London" nmae: "typo" }"#).unwrap_err();
+    assert_eq!(err.kind, ParseErrorKind::UnknownField);
+}
+
+#[test]
+fn unknown_map_entry_fields_rejected_by_default() {
+    let err =
+        decode_from_str::<Inventory>(r#"stock: [{key: "apples" value: 10 stok: 11}]"#).unwrap_err();
+    assert_eq!(err.kind, ParseErrorKind::UnknownField);
+}
+
+#[test]
+fn reserved_field_names_are_skipped() {
+    use crate::edge::WithReserved;
+
+    let msg: WithReserved = decode_from_str(
+        r#"old_name: 42 id: 1 deprecated_name { ignored: "value" } name: "ok" active: true after_gap: 7"#,
+    )
+    .unwrap();
+    assert_eq!(msg.id, 1);
+    assert_eq!(msg.name, "ok");
+    assert!(msg.active);
+    assert_eq!(msg.after_gap, 7);
+
+    // List and angle-bracket message forms are consumed too.
+    let msg: WithReserved =
+        decode_from_str(r#"old_field: [1, 2] deprecated_name < ignored: "v" > id: 2"#).unwrap();
+    assert_eq!(msg.id, 2);
+
+    // A name that is neither declared nor reserved still errors on this message.
+    let err = decode_from_str::<WithReserved>("old_nmae: 1").unwrap_err();
+    assert_eq!(err.kind, ParseErrorKind::UnknownField);
 }
 
 // ── merge semantics ─────────────────────────────────────────────────────────

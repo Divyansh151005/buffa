@@ -19,7 +19,7 @@ use std::io::{self, Read, Write};
 use buffa::Message;
 use buffa_codegen::generated::compiler::code_generator_response::File as CodeGeneratorResponseFile;
 use buffa_codegen::generated::compiler::CodeGeneratorResponse;
-use buffa_codegen::generated::descriptor::{Edition, FileDescriptorProto};
+use buffa_codegen::generated::descriptor::Edition;
 
 use buffa_codegen::{CodeGenConfig, EnumTypeOverride, FeatureOverride};
 
@@ -108,22 +108,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Parse plugin parameters (e.g., "views=true,unknown_fields=false").
     let config = parse_config(request.parameter.as_deref().unwrap_or(""))?;
 
-    // Drop excluded packages from the generate set. `include_imports` adds
-    // imported files (WKTs, buf.validate, gnostic, …) to file_to_generate;
-    // excluding a package skips emitting its files while leaving its
-    // descriptors in `proto_file` for type resolution. buffa-codegen only
-    // emits files listed in file_to_generate, so filtering here is enough.
-    let file_to_generate = filter_excluded_files(
-        &request.file_to_generate,
-        &request.proto_file,
-        &config.exclude_packages,
-    );
-
     // Run code generation, forwarding non-fatal warnings to stderr (protoc
-    // surfaces plugin stderr to the user).
+    // surfaces plugin stderr to the user). Excluded packages are in
+    // `config.codegen.exclude_packages`; `generate_with_diagnostics` filters
+    // them internally so the filtering logic is shared with the buffa-build path.
     let (generated, warnings) = buffa_codegen::generate_with_diagnostics(
         &request.proto_file,
-        &file_to_generate,
+        &request.file_to_generate,
         &config.codegen,
     )?;
     for warning in &warnings {
@@ -154,38 +145,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Remove files whose proto package is excluded (see
-/// [`buffa_codegen::package_is_excluded`]) from the generate set.
-///
-/// A file listed in `file_to_generate` with no matching descriptor is kept —
-/// `generate_with_diagnostics` reports the missing descriptor with a clear
-/// error, which is more useful than silently dropping it here.
-fn filter_excluded_files(
-    file_to_generate: &[String],
-    proto_file: &[FileDescriptorProto],
-    excludes: &[String],
-) -> Vec<String> {
-    if excludes.is_empty() {
-        return file_to_generate.to_vec();
-    }
-    file_to_generate
-        .iter()
-        .filter(|name| {
-            match proto_file
-                .iter()
-                .find(|fd| fd.name.as_deref() == Some(name.as_str()))
-            {
-                Some(fd) => !buffa_codegen::package_is_excluded(
-                    fd.package.as_deref().unwrap_or(""),
-                    excludes,
-                ),
-                None => true,
-            }
-        })
-        .cloned()
-        .collect()
-}
-
 /// Write the serialized CodeGeneratorResponse to stdout.
 fn write_response(response: &CodeGeneratorResponse) -> io::Result<()> {
     let mut output = Vec::new();
@@ -205,10 +164,11 @@ fn feature_flags() -> u64 {
 /// Plugin configuration parsed from the parameter string.
 struct PluginConfig {
     /// Code generation options passed to buffa-codegen.
+    ///
+    /// `exclude_packages` are stored in `codegen.exclude_packages` so the
+    /// filtering happens inside `generate_with_diagnostics` and is shared
+    /// uniformly with the `buffa-build` path.
     codegen: CodeGenConfig,
-    /// Proto packages to drop from the generate set (see the
-    /// `exclude_package` option). Normalized to no leading dot.
-    exclude_packages: Vec<String>,
 }
 
 /// Parse the plugin parameter string into a PluginConfig.
@@ -222,13 +182,10 @@ struct PluginConfig {
 ///   --buffa_opt=extern_path=.my.common.Shared=::shared_types::Shared
 fn parse_config(params: &str) -> Result<PluginConfig, String> {
     let mut codegen = CodeGenConfig::default();
-    let mut exclude_packages: Vec<String> = Vec::new();
+    let mut unbox_oneof = false;
 
     if params.is_empty() {
-        return Ok(PluginConfig {
-            codegen,
-            exclude_packages,
-        });
+        return Ok(PluginConfig { codegen });
     }
 
     for param in params.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -349,6 +306,16 @@ fn parse_config(params: &str) -> Result<PluginConfig, String> {
             "idiomatic_field_names" => {
                 codegen.idiomatic_field_names = parse_bool("idiomatic_field_names", value)?
             }
+            // `unbox_oneof=true` opts every non-recursive message/group
+            // variant into inline storage. Path-scoped rules use the
+            // repeatable `unbox_oneof_in=<path>` spelling, matching the
+            // builder API's `unbox_oneof()` / `unbox_oneof_in()` split.
+            "unbox_oneof" => unbox_oneof = parse_bool("unbox_oneof", value)?,
+            "unbox_oneof_in" => {
+                codegen
+                    .unboxed_oneof_fields
+                    .push(normalize_unbox_oneof_path(value.trim())?);
+            }
             // `type_name_prefix=Rpc` prepends a prefix to every generated
             // message/enum type name (and their view types). The value is
             // passed through verbatim; buffa-codegen rejects anything that
@@ -386,7 +353,9 @@ fn parse_config(params: &str) -> Result<PluginConfig, String> {
             // optional (normalized like extern_path). protoc-gen-buffa-packaging
             // accepts the same option so the generated mod.rs stays in sync.
             "exclude_package" => {
-                exclude_packages.push(buffa_codegen::normalize_exclude_package(value)?);
+                codegen
+                    .exclude_packages
+                    .push(buffa_codegen::normalize_exclude_package(value)?);
             }
             "extern_path" => {
                 // value is "<proto_path>=<rust_path>"
@@ -432,6 +401,10 @@ fn parse_config(params: &str) -> Result<PluginConfig, String> {
                 ))
             }
         }
+    }
+
+    if unbox_oneof {
+        codegen.unboxed_oneof_fields.push(".".to_string());
     }
 
     // Without reflection there is no embedded descriptor pool to share.
@@ -493,10 +466,7 @@ fn parse_config(params: &str) -> Result<PluginConfig, String> {
         );
     }
 
-    Ok(PluginConfig {
-        codegen,
-        exclude_packages,
-    })
+    Ok(PluginConfig { codegen })
 }
 
 fn parse_bool(key: &str, value: &str) -> Result<bool, String> {
@@ -533,11 +503,18 @@ fn parse_feature_override(spec: &str) -> Result<FeatureOverride, String> {
 }
 
 fn normalize_override_path(path: &str) -> Result<String, String> {
+    normalize_proto_path(path, "feature override")
+}
+
+fn normalize_unbox_oneof_path(path: &str) -> Result<String, String> {
+    normalize_proto_path(path, "unbox_oneof_in")
+}
+
+fn normalize_proto_path(path: &str, label: &str) -> Result<String, String> {
     if path.is_empty() {
-        return Err(
-            "feature override rules require a non-empty proto path; use '.' explicitly to match everything"
-                .to_string(),
-        );
+        return Err(format!(
+            "{label} rules require a non-empty proto path; use '.' explicitly to match everything"
+        ));
     }
 
     if path == "." {
@@ -553,10 +530,9 @@ fn normalize_override_path(path: &str) -> Result<String, String> {
     }
 
     if path.is_empty() {
-        return Err(
-            "feature override rules require a non-empty proto path; use '.' explicitly to match everything"
-                .to_string(),
-        );
+        return Err(format!(
+            "{label} rules require a non-empty proto path; use '.' explicitly to match everything"
+        ));
     }
     Ok(path)
 }
@@ -678,6 +654,69 @@ mod tests {
     fn idiomatic_field_names_defaults_off() {
         let config = parse_config("").unwrap();
         assert!(!config.codegen.idiomatic_field_names);
+    }
+
+    #[test]
+    fn unbox_oneof_is_a_boolean_blanket_toggle() {
+        let config = parse_config("unbox_oneof=true").unwrap();
+        assert_eq!(config.codegen.unboxed_oneof_fields, vec![".".to_string()]);
+
+        let config = parse_config("unbox_oneof=false").unwrap();
+        assert!(config.codegen.unboxed_oneof_fields.is_empty());
+
+        let config = parse_config("unbox_oneof=true,unbox_oneof=false").unwrap();
+        assert!(config.codegen.unboxed_oneof_fields.is_empty());
+
+        let config = parse_config("unbox_oneof=false,unbox_oneof=true").unwrap();
+        assert_eq!(config.codegen.unboxed_oneof_fields, vec![".".to_string()]);
+    }
+
+    #[test]
+    fn unbox_oneof_in_is_repeatable_and_normalized() {
+        let config = parse_config(
+            "unbox_oneof_in=my.pkg.Msg.body.small,unbox_oneof_in= . ,unbox_oneof_in=.my.pkg.Other. ",
+        )
+        .unwrap();
+        assert_eq!(
+            config.codegen.unboxed_oneof_fields,
+            vec![
+                ".my.pkg.Msg.body.small".to_string(),
+                ".".to_string(),
+                ".my.pkg.Other".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unbox_oneof_in_rejects_empty_or_whitespace() {
+        for params in [
+            "unbox_oneof_in=",
+            "unbox_oneof_in=   ",
+            "unbox_oneof_in=...",
+        ] {
+            let err = parse_err(params);
+            assert!(err.contains("unbox_oneof_in rules"), "{params:?}: {err}");
+            assert!(err.contains("non-empty proto path"), "{params:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn unbox_oneof_rejects_non_boolean_values() {
+        // A path or a near-miss boolean is an error, never a silent no-op.
+        for params in [
+            "unbox_oneof=.my.pkg.Other",
+            "unbox_oneof=TRUE",
+            "unbox_oneof=1",
+        ] {
+            let err = parse_err(params);
+            assert!(err.contains("unbox_oneof"), "{params:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn unbox_oneof_defaults_empty() {
+        let config = parse_config("").unwrap();
+        assert!(config.codegen.unboxed_oneof_fields.is_empty());
     }
 
     #[test]
@@ -939,13 +978,16 @@ mod tests {
     #[test]
     fn exclude_package_with_leading_dot_is_normalized() {
         let config = parse_config("exclude_package=.buf.validate").unwrap();
-        assert_eq!(config.exclude_packages, vec!["buf.validate".to_string()]);
+        assert_eq!(
+            config.codegen.exclude_packages,
+            vec!["buf.validate".to_string()]
+        );
     }
 
     #[test]
     fn exclude_package_without_leading_dot() {
         let config = parse_config("exclude_package=gnostic").unwrap();
-        assert_eq!(config.exclude_packages, vec!["gnostic".to_string()]);
+        assert_eq!(config.codegen.exclude_packages, vec!["gnostic".to_string()]);
     }
 
     #[test]
@@ -953,7 +995,7 @@ mod tests {
         let config =
             parse_config("exclude_package=.buf.validate,exclude_package=.gnostic").unwrap();
         assert_eq!(
-            config.exclude_packages,
+            config.codegen.exclude_packages,
             vec!["buf.validate".to_string(), "gnostic".to_string()]
         );
     }
@@ -961,7 +1003,7 @@ mod tests {
     #[test]
     fn exclude_package_defaults_empty() {
         let config = parse_config("").unwrap();
-        assert!(config.exclude_packages.is_empty());
+        assert!(config.codegen.exclude_packages.is_empty());
     }
 
     #[test]
@@ -970,49 +1012,6 @@ mod tests {
         assert!(err.contains("exclude_package"));
         let err = parse_err("exclude_package=.");
         assert!(err.contains("exclude_package"));
-    }
-
-    fn fd(name: &str, package: &str) -> FileDescriptorProto {
-        FileDescriptorProto {
-            name: Some(name.into()),
-            package: Some(package.into()),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn filter_excluded_files_drops_excluded_packages() {
-        let protos = vec![
-            fd("example/user/v1/user.proto", "example.user.v1"),
-            fd("buf/validate/validate.proto", "buf.validate"),
-            fd("gnostic/openapi/v3/openapiv3.proto", "gnostic.openapi.v3"),
-        ];
-        let all: Vec<String> = protos.iter().map(|f| f.name.clone().unwrap()).collect();
-        let kept = filter_excluded_files(
-            &all,
-            &protos,
-            &["buf.validate".to_string(), "gnostic".to_string()],
-        );
-        assert_eq!(kept, vec!["example/user/v1/user.proto".to_string()]);
-    }
-
-    #[test]
-    fn filter_excluded_files_no_excludes_is_identity() {
-        let protos = vec![fd("example/user/v1/user.proto", "example.user.v1")];
-        let all: Vec<String> = protos.iter().map(|f| f.name.clone().unwrap()).collect();
-        assert_eq!(filter_excluded_files(&all, &protos, &[]), all);
-    }
-
-    #[test]
-    fn filter_excluded_files_keeps_file_without_descriptor() {
-        // No descriptor for the entry → kept, so generate() reports the
-        // missing-descriptor error rather than silently dropping it.
-        let kept = filter_excluded_files(
-            &["orphan.proto".to_string()],
-            &[],
-            &["buf.validate".to_string()],
-        );
-        assert_eq!(kept, vec!["orphan.proto".to_string()]);
     }
 
     #[test]
