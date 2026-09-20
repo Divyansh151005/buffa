@@ -198,23 +198,15 @@ fn parse_config(params: &str) -> Result<PluginConfig, String> {
             "unknown_fields" => {
                 codegen.preserve_unknown_fields = parse_bool("unknown_fields", value)?
             }
-            // Repeatable. Enables preservation for matching messages on top
-            // of the global `unknown_fields` default (last matching rule
-            // wins). Same proto-path prefix matching as unbox_oneof_in.
+            // Repeatable. Enables preservation for matching messages (and the
+            // messages nested in them) on top of the global `unknown_fields`
+            // default, whatever the option order; last matching rule wins.
+            // Same path grammar as `unbox_oneof_in`.
             "unknown_fields_in" => {
-                let path = value.trim();
-                if path.is_empty() {
-                    return Err(
-                        "'unknown_fields_in' requires a non-empty proto path; use '.' to match everything"
-                            .to_string(),
-                    );
-                }
-                let path = if path.starts_with('.') {
-                    path.to_string()
-                } else {
-                    format!(".{path}")
-                };
-                codegen.preserve_unknown_fields_in.push((path, true));
+                codegen.preserve_unknown_fields_in.push((
+                    normalize_proto_path(value.trim(), "unknown_fields_in")?,
+                    true,
+                ));
             }
             "json" => codegen.generate_json = parse_bool("json", value)?,
             "text" => codegen.generate_text = parse_bool("text", value)?,
@@ -601,7 +593,7 @@ mod tests {
     #[test]
     fn unknown_fields_in_is_repeatable_and_normalized() {
         let config = parse_config(
-            "unknown_fields=false,unknown_fields_in=wa.Keep,unknown_fields_in=.wa.Also",
+            "unknown_fields_in=wa.Keep,unknown_fields=false,unknown_fields_in=.wa.Also.,unknown_fields_in= . ",
         )
         .unwrap();
         assert!(!config.codegen.preserve_unknown_fields);
@@ -610,14 +602,22 @@ mod tests {
             vec![
                 (".wa.Keep".to_string(), true),
                 (".wa.Also".to_string(), true),
+                (".".to_string(), true),
             ]
         );
     }
 
     #[test]
-    fn empty_unknown_fields_in_errors() {
-        let err = parse_err("unknown_fields_in=");
-        assert!(err.contains("unknown_fields_in"));
+    fn unknown_fields_in_rejects_empty_or_whitespace() {
+        for params in [
+            "unknown_fields_in=",
+            "unknown_fields_in=   ",
+            "unknown_fields_in=...",
+        ] {
+            let err = parse_err(params);
+            assert!(err.contains("unknown_fields_in rules"), "{params:?}: {err}");
+            assert!(err.contains("non-empty proto path"), "{params:?}: {err}");
+        }
     }
 
     #[test]

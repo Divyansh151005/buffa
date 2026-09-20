@@ -1319,10 +1319,43 @@ fn inline_preserve_unknown_fields_in_last_match_and_nested() {
     );
     assert!(struct_has_unknown_fields(&content, "Keep"));
     assert!(!struct_has_unknown_fields(&content, "Drop"));
-    // Package prefix `.test` would enable Outer; the nested Inner rule does
-    // not change Outer. Inner is on via its own more specific enable.
+    // The package rule `.test` enables Outer; Inner is enabled by both the
+    // package rule and its own rule.
     assert!(struct_has_unknown_fields(&content, "Outer"));
     assert!(struct_has_unknown_fields(&content, "Inner"));
+}
+
+#[test]
+fn inline_preserve_unknown_fields_in_outer_on_inner_off() {
+    // A rule naming `Outer` is a prefix of `Outer.Inner`, so it covers the
+    // nested message too; a later, more specific `false` entry (expressible
+    // through `CodeGenConfig`, not the enable-only builder) carves it out.
+    let proto = r#"
+        syntax = "proto3";
+        package test;
+        message Outer {
+          message Inner {}
+        }
+        "#;
+    let mut config = no_views();
+    config.preserve_unknown_fields = false;
+    config.preserve_unknown_fields_in = vec![(".test.Outer".to_string(), true)];
+    let content = generate_proto(proto, &config);
+    assert!(struct_has_unknown_fields(&content, "Outer"));
+    assert!(
+        struct_has_unknown_fields(&content, "Inner"),
+        "a rule naming Outer covers Outer.Inner: {content}"
+    );
+
+    config
+        .preserve_unknown_fields_in
+        .push((".test.Outer.Inner".to_string(), false));
+    let content = generate_proto(proto, &config);
+    assert!(struct_has_unknown_fields(&content, "Outer"));
+    assert!(
+        !struct_has_unknown_fields(&content, "Inner"),
+        "a later Inner=false rule must win over the enclosing Outer=true rule: {content}"
+    );
 }
 
 #[test]

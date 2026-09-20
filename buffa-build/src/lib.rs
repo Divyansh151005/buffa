@@ -666,7 +666,7 @@ impl Config {
     /// embedded / `no_std` targets and large in-memory collections of small
     /// messages.
     ///
-    /// To keep the global off-switch and still preserve selected types, use
+    /// To keep the global off-switch and still preserve selected messages, use
     /// [`preserve_unknown_fields_in`](Self::preserve_unknown_fields_in).
     #[must_use]
     pub fn preserve_unknown_fields(mut self, enabled: bool) -> Self {
@@ -676,40 +676,61 @@ impl Config {
 
     /// Enable unknown-field preservation for matching messages, on top of
     /// the global [`preserve_unknown_fields`](Self::preserve_unknown_fields)
-    /// default.
+    /// setting.
     ///
-    /// Each path is a fully-qualified proto **message** prefix, e.g.
-    /// `".wa.CallLogRecord"` for one type or `".wa"` for a package (same
-    /// matching as [`unbox_oneof_in`](Self::unbox_oneof_in)). A leading dot
-    /// is added if missing. Nested messages resolve independently of their
-    /// enclosing type: preserving an outer message does not preserve its
-    /// children.
+    /// Each path is a fully-qualified proto path prefix, e.g.
+    /// `".wa.CallLogRecord"` for one message or `".wa"` for a package (same
+    /// matching as [`unbox_oneof_in`](Self::unbox_oneof_in)); `"."` matches
+    /// every message. A leading dot is added if missing and trailing dots
+    /// are trimmed. An empty path is warned about and ignored so `"."`
+    /// remains the only catch-all spelling.
     ///
-    /// Rules accumulate; the **last** matching rule wins. Typical use is
-    /// the global off switch first, then this for the types that must
-    /// still round-trip:
+    /// A rule covers the message it names **and every message nested inside
+    /// it**; a rule naming a nested message does not cover its enclosing
+    /// message. Rules are enable-only, so this builder cannot exclude a
+    /// nested message from a rule that names its parent
+    /// ([`CodeGenConfig::preserve_unknown_fields_in`](buffa_codegen::CodeGenConfig::preserve_unknown_fields_in)
+    /// also accepts disabling entries, and the last matching entry wins).
+    /// Preservation is a property of each message *type*: a preserved
+    /// message's sub-messages keep their own unknown fields only if their
+    /// types are covered too.
+    ///
+    /// Repeated calls accumulate. The call order relative to
+    /// [`preserve_unknown_fields`](Self::preserve_unknown_fields) does not
+    /// matter; the rules apply on top of whichever global value is in force
+    /// at [`compile`](Self::compile) time. They only change the outcome when
+    /// the global setting is off. A rule that matches no generated message
+    /// produces a `cargo:warning` from this build (surfaced via
+    /// [`CodeGenWarning`](buffa_codegen::CodeGenWarning)), since an inert
+    /// rule silently loses round-trip fidelity for the type it was meant to
+    /// keep.
+    ///
+    /// A message that does not preserve unknown fields has no
+    /// `__buffa_unknown_fields` field, and so also loses everything built on
+    /// it: the `ExtensionSet` impl (`extension()` / `set_extension()` /
+    /// `has_extension()`), `ReflectMessage::unknown_fields`, extension
+    /// round-tripping through textproto, and `[ext]` keys in JSON.
     ///
     /// ```rust,ignore
     /// buffa_build::Config::new()
     ///     .preserve_unknown_fields(false)
     ///     .preserve_unknown_fields_in(&[".wa.CallLogRecord", ".wa.SyncdMutation"])
     /// ```
-    ///
-    /// Per-field granularity is not representable — the flag gates whether
-    /// the message struct carries `__buffa_unknown_fields` at all.
     #[must_use]
     pub fn preserve_unknown_fields_in(mut self, paths: &[impl AsRef<str>]) -> Self {
-        self.codegen_config
-            .preserve_unknown_fields_in
-            .extend(paths.iter().map(|p| {
-                let p = p.as_ref();
-                let path = if p.starts_with('.') {
-                    p.to_string()
-                } else {
-                    format!(".{p}")
-                };
-                (path, true)
-            }));
+        for raw in paths.iter().map(AsRef::as_ref) {
+            let normalized = normalize_override_path(raw);
+            if normalized.is_empty() {
+                println!(
+                    "cargo:warning=buffa: preserve_unknown_fields_in path '{raw}' \
+                     normalizes to empty and will be ignored"
+                );
+                continue;
+            }
+            self.codegen_config
+                .preserve_unknown_fields_in
+                .push((normalized, true));
+        }
         self
     }
 
@@ -2055,8 +2076,9 @@ fn normalize_attr_path(mut path: String) -> String {
     path
 }
 
-/// Normalize an `override_feature_in` path: trim whitespace, prepend the
-/// leading dot if absent, and strip trailing dots. Unlike
+/// Normalize an `override_feature_in` / `preserve_unknown_fields_in` path:
+/// trim whitespace, prepend the leading dot if absent, and strip trailing
+/// dots. Unlike
 /// [`normalize_attr_path`], an entry that normalizes to empty (e.g. `"..."`)
 /// is returned empty rather than collapsing to the `"."` catch-all — the
 /// caller skips it, so `"."` stays the only global opt-in spelling.
@@ -2486,10 +2508,15 @@ mod tests {
     }
 
     #[test]
-    fn preserve_unknown_fields_in_normalizes_leading_dot() {
+    fn preserve_unknown_fields_in_normalizes_paths() {
         let config = Config::new()
             .preserve_unknown_fields(false)
-            .preserve_unknown_fields_in(&["wa.CallLogRecord", ".wa.SyncdMutation"])
+            .preserve_unknown_fields_in(&[
+                "wa.CallLogRecord",
+                ".wa.SyncdMutation.",
+                " .wa.Other ",
+                ".",
+            ])
             .codegen_config;
         assert!(!config.preserve_unknown_fields);
         assert_eq!(
@@ -2497,7 +2524,23 @@ mod tests {
             vec![
                 (".wa.CallLogRecord".to_string(), true),
                 (".wa.SyncdMutation".to_string(), true),
+                (".wa.Other".to_string(), true),
+                (".".to_string(), true),
             ]
+        );
+    }
+
+    #[test]
+    fn preserve_unknown_fields_in_empty_path_is_not_catchall() {
+        // `""` and `"..."` must not collapse to the `"."` catch-all, which
+        // would re-enable preservation for every message.
+        let config = Config::new()
+            .preserve_unknown_fields(false)
+            .preserve_unknown_fields_in(&["", "   ", "...", ".wa.Keep"])
+            .codegen_config;
+        assert_eq!(
+            config.preserve_unknown_fields_in,
+            vec![(".wa.Keep".to_string(), true)]
         );
     }
 

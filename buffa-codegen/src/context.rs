@@ -1076,22 +1076,27 @@ impl<'a> CodeGenContext<'a> {
     /// Whether this message stores unknown fields.
     ///
     /// Starts from [`CodeGenConfig::preserve_unknown_fields`] and applies
-    /// [`CodeGenConfig::preserve_unknown_fields_in`] in order; last match
-    /// wins. `msg_fqn` is the message's proto path, with or without a
-    /// leading dot (`"pkg.Msg"` or `".pkg.Msg"`).
+    /// [`CodeGenConfig::preserve_unknown_fields_in`]; the **last** matching
+    /// rule wins. Rules use proto-segment-aware prefix matching, so a rule
+    /// naming a message also covers the messages nested inside it, while a
+    /// rule naming a nested message does not cover its enclosing message.
+    /// `msg_fqn` is the message's proto path, with or without a leading dot
+    /// (`"pkg.Msg"` or `".pkg.Msg"`).
     pub fn preserve_unknown_fields(&self, msg_fqn: &str) -> bool {
+        let rules = &self.config.preserve_unknown_fields_in;
+        if rules.is_empty() {
+            return self.config.preserve_unknown_fields;
+        }
         let dotted = if msg_fqn.starts_with('.') {
             Cow::Borrowed(msg_fqn)
         } else {
             Cow::Owned(format!(".{msg_fqn}"))
         };
-        let mut value = self.config.preserve_unknown_fields;
-        for (prefix, enabled) in &self.config.preserve_unknown_fields_in {
-            if matches_proto_prefix(prefix, dotted.as_ref()) {
-                value = *enabled;
-            }
-        }
-        value
+        rules
+            .iter()
+            .rev()
+            .find(|(prefix, _)| matches_proto_prefix(prefix, &dotted))
+            .map_or(self.config.preserve_unknown_fields, |(_, enabled)| *enabled)
     }
 
     /// Check whether a message-typed oneof variant at the given proto path is
@@ -2937,17 +2942,81 @@ mod tests {
         assert!(!ctx.preserve_unknown_fields("other.Msg"));
     }
 
-    #[test]
-    fn preserve_unknown_fields_nested_message_is_independent() {
+    /// Build a context over a single empty file and resolve `fqns` under
+    /// `global` + `rules`, in order.
+    fn resolve_preserve(global: bool, rules: &[(&str, bool)], fqns: &[&str]) -> Vec<bool> {
         let files = [make_file("t.proto", "test", vec![msg("Outer")], vec![])];
         let config = CodeGenConfig {
-            preserve_unknown_fields: false,
-            preserve_unknown_fields_in: vec![(".test.Outer.Inner".to_string(), true)],
+            preserve_unknown_fields: global,
+            preserve_unknown_fields_in: rules
+                .iter()
+                .map(|(path, enabled)| ((*path).to_string(), *enabled))
+                .collect(),
             ..CodeGenConfig::default()
         };
         let ctx = CodeGenContext::new(&files, &config, &config.extern_paths);
+        fqns.iter()
+            .map(|f| ctx.preserve_unknown_fields(f))
+            .collect()
+    }
+
+    #[test]
+    fn preserve_unknown_fields_child_rule_does_not_enable_parent() {
         // Enabling the nested type does not enable the enclosing message.
-        assert!(!ctx.preserve_unknown_fields("test.Outer"));
-        assert!(ctx.preserve_unknown_fields("test.Outer.Inner"));
+        let got = resolve_preserve(
+            false,
+            &[(".test.Outer.Inner", true)],
+            &["test.Outer", "test.Outer.Inner", "test.Outer.Inner.Deep"],
+        );
+        assert_eq!(got, [false, true, true]);
+    }
+
+    #[test]
+    fn preserve_unknown_fields_parent_rule_covers_nested_messages() {
+        // A rule naming a message is a proto-segment prefix, so it also
+        // covers every message nested inside it, but not a sibling whose
+        // name merely starts with the same characters.
+        let got = resolve_preserve(
+            false,
+            &[(".test.Outer", true)],
+            &[
+                "test.Outer",
+                "test.Outer.Inner",
+                "test.Outer.Inner.Deep",
+                "test.OuterX",
+                "test.Other",
+            ],
+        );
+        assert_eq!(got, [true, true, true, false, false]);
+    }
+
+    #[test]
+    fn preserve_unknown_fields_later_rule_carves_out_nested_message() {
+        // Outer on, Inner off: expressible through `CodeGenConfig` because a
+        // later, more specific rule wins over the enclosing one.
+        let fqns = ["test.Outer", "test.Outer.Inner", "test.Outer.Inner.Deep"];
+        let got = resolve_preserve(
+            false,
+            &[(".test.Outer", true), (".test.Outer.Inner", false)],
+            &fqns,
+        );
+        assert_eq!(got, [true, false, false]);
+        // Rule order decides: the same rules reversed re-enable Inner.
+        let got = resolve_preserve(
+            false,
+            &[(".test.Outer.Inner", false), (".test.Outer", true)],
+            &fqns,
+        );
+        assert_eq!(got, [true, true, true]);
+    }
+
+    #[test]
+    fn preserve_unknown_fields_rules_can_disable_under_global_on() {
+        let got = resolve_preserve(
+            true,
+            &[(".test.Drop", false)],
+            &["test.Keep", "test.Drop", "test.Drop.Child"],
+        );
+        assert_eq!(got, [true, false, false]);
     }
 }
