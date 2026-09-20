@@ -297,6 +297,13 @@ pub enum PoolError {
         other_start: u32,
         other_end: u32,
     },
+    /// A message field's number lies inside one of the message's own
+    /// extension ranges.
+    FieldNumberInExtensionRange {
+        message: String,
+        name: String,
+        number: u32,
+    },
     /// An open enum's first declared value has a non-zero number.
     OpenEnumFirstValueNotZero {
         enum_name: String,
@@ -515,6 +522,14 @@ impl core::fmt::Display for PoolError {
                 f,
                 "message {message} extension range {start}..{end} overlaps extension range \
                  {other_start}..{other_end}"
+            ),
+            Self::FieldNumberInExtensionRange {
+                message,
+                name,
+                number,
+            } => write!(
+                f,
+                "message {message} field {name:?} uses number {number} inside an extension range"
             ),
             Self::OpenEnumFirstValueNotZero {
                 enum_name,
@@ -1770,6 +1785,26 @@ impl DescriptorPool {
             if reach.map_or(true, |(_, prev_end, _)| end > prev_end) {
                 reach = Some((start, end, i));
             }
+        }
+
+        // A declared field may not sit inside one of the message's own
+        // extension ranges (protoc: "Extension range $0 to $1 includes field
+        // $2"). Index the ranges once so the check is a binary search per
+        // field rather than a scan of every range.
+        let extension_lookup = ReservedRanges::from_half_open(
+            extension_ranges
+                .iter()
+                .map(|&(start, end)| (i64::from(start), i64::from(end))),
+        );
+        if let Some(fd) = fields
+            .iter()
+            .find(|fd| extension_lookup.contains(fd.number))
+        {
+            return Err(PoolError::FieldNumberInExtensionRange {
+                message: fqn,
+                name: fd.name.clone(),
+                number: fd.number,
+            });
         }
 
         // Replace the placeholder. Pass 1 registered messages depth-first
